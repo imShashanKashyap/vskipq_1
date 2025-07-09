@@ -1,0 +1,928 @@
+import type { Express, Request as ExpressRequest, Response } from "express";
+import passport from "passport";
+import { createServer, type Server } from "http";
+import { WebSocketServer, WebSocket } from "ws"; 
+import { storage } from "./storage";
+import { z } from "zod";
+import { 
+  insertTableSchema, 
+  insertMenuItemSchema, 
+  insertOrderSchema,
+  insertOrderItemSchema,
+  insertUserSchema
+} from "@shared/schema";
+import { generateQrCodeUrl } from "./qrcode";
+import { sendWhatsAppMessage, sendOTPViaWhatsApp, verifyOTP } from "./whatsapp";
+import { scrypt, randomBytes, timingSafeEqual } from "crypto";
+import { promisify } from "util";
+
+// Password utility functions
+const scryptAsync = promisify(scrypt);
+
+// Hash a password with a salt
+async function hashPassword(password: string): Promise<string> {
+  const salt = randomBytes(16).toString('hex');
+  const derivedKey = await scryptAsync(password, salt, 64) as Buffer;
+  return `${derivedKey.toString('hex')}.${salt}`;
+}
+
+// Check if submitted password matches stored hash
+export async function verifyPassword(storedHash: string, suppliedPassword: string): Promise<boolean> {
+  try {
+    const [hashedPassword, salt] = storedHash.split('.');
+    const derivedKey = await scryptAsync(suppliedPassword, salt, 64) as Buffer;
+    return hashedPassword === derivedKey.toString('hex');
+  } catch (error) {
+    console.error('Error verifying password:', error);
+    return false;
+  }
+}
+
+// Define websocket clients map - each key is a table number or "chef"
+const clients: Map<string, WebSocket[]> = new Map();
+
+// Broadcast message to all connected clients for a specific target
+// and to related parties based on the message type and content
+function broadcastMessage(target: string, message: any) {
+  const payload = JSON.stringify(message);
+  const sentTo = new Set<WebSocket>(); // Track clients we've sent to already
+  
+  // Send to specific target clients first
+  const targetClients = clients.get(target) || [];
+  targetClients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(payload);
+      sentTo.add(client);
+    }
+  });
+  
+  // Always notify all chefs about order updates
+  if (target !== "chef") {
+    const chefClients = clients.get("chef") || [];
+    chefClients.forEach(client => {
+      if (client.readyState === WebSocket.OPEN && !sentTo.has(client)) {
+        client.send(payload);
+        sentTo.add(client);
+      }
+    });
+  }
+  
+  // If this is an order update or creation with restaurant info
+  if (message.type === 'ORDER_UPDATED' || message.type === 'ORDER_CREATED') {
+    if (message.order && message.order.table && message.order.table.tableNumber) {
+      // Get the table number to notify any customers tracking that table
+      const tableNumber = message.order.table.tableNumber.toString();
+      
+      // Don't send to the originating table again
+      if (tableNumber !== target) {
+        const tableClients = clients.get(tableNumber) || [];
+        tableClients.forEach(client => {
+          if (client.readyState === WebSocket.OPEN && !sentTo.has(client)) {
+            client.send(payload);
+            sentTo.add(client);
+          }
+        });
+      }
+      
+      // If there's a restaurant ID, notify the restaurant-specific channel
+      if (message.order.restaurant && message.order.restaurant.id) {
+        const restaurantId = message.order.restaurant.id;
+        const restaurantChannel = `restaurant-${restaurantId}`;
+        
+        // Don't send to the originating restaurant channel again
+        if (restaurantChannel !== target) {
+          const restaurantClients = clients.get(restaurantChannel) || [];
+          restaurantClients.forEach(client => {
+            if (client.readyState === WebSocket.OPEN && !sentTo.has(client)) {
+              client.send(payload);
+              sentTo.add(client);
+            }
+          });
+        }
+      }
+    }
+  }
+  
+  console.log(`Broadcasted ${message.type} to ${sentTo.size} clients`);
+}
+
+// Add client to the clients map
+function addClient(target: string, ws: WebSocket) {
+  if (!clients.has(target)) {
+    clients.set(target, []);
+  }
+  clients.get(target)?.push(ws);
+}
+
+// Remove client from the clients map
+function removeClient(target: string, ws: WebSocket) {
+  if (clients.has(target)) {
+    const targetClients = clients.get(target) || [];
+    const index = targetClients.indexOf(ws);
+    if (index !== -1) {
+      targetClients.splice(index, 1);
+    }
+    if (targetClients.length === 0) {
+      clients.delete(target);
+    }
+  }
+}
+
+export async function registerRoutes(app: Express): Promise<Server> {
+  const httpServer = createServer(app);
+  
+  // Setup WebSocket server
+  const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
+  
+  wss.on('connection', (ws, req) => {
+    // Extract target from query params (table number or "chef")
+    const url = new URL(req.url || '', `http://${req.headers.host}`);
+    const target = url.searchParams.get('target');
+    
+    if (!target) {
+      ws.close();
+      return;
+    }
+    
+    // Add client to clients map
+    addClient(target, ws);
+    
+    ws.on('message', (message) => {
+      try {
+        const data = JSON.parse(message.toString());
+        // Handle specific message types if needed
+        console.log(`Received message from ${target}:`, data);
+      } catch (error) {
+        console.error('Failed to parse message:', error);
+      }
+    });
+    
+    ws.on('close', () => {
+      removeClient(target, ws);
+    });
+  });
+  
+  // Auth endpoints are now handled in auth.ts
+  
+  // Table endpoints
+  app.get('/api/tables', async (req, res) => {
+    try {
+      const restaurantId = req.query.restaurantId ? parseInt(req.query.restaurantId as string, 10) : undefined;
+      const tableNumber = req.query.tableNumber ? parseInt(req.query.tableNumber as string, 10) : undefined;
+      
+      // If both restaurant ID and table number are provided, get the specific table
+      if (restaurantId && tableNumber) {
+        console.log(`Looking for table ${tableNumber} in restaurant ${restaurantId}`);
+        const table = await storage.getTableByNumber(tableNumber, restaurantId);
+        if (table) {
+          console.log(`Found table: ${JSON.stringify(table)}`);
+          // Return as array to maintain API consistency
+          return res.json([table]);
+        } else {
+          console.log(`No table ${tableNumber} found for restaurant ${restaurantId}`);
+          return res.json([]);
+        }
+      }
+      
+      // Otherwise get all tables for the restaurant
+      const tables = await storage.getTables(restaurantId);
+      res.json(tables);
+    } catch (error) {
+      console.error("Error fetching tables:", error);
+      res.status(500).json({ message: 'Failed to fetch tables' });
+    }
+  });
+  
+  app.get('/api/tables/:tableNumber', async (req, res) => {
+    try {
+      const tableNumber = parseInt(req.params.tableNumber, 10);
+      const restaurantId = req.query.restaurantId ? parseInt(req.query.restaurantId as string, 10) : 1; // Default to restaurant ID 1
+      
+      if (isNaN(tableNumber)) {
+        return res.status(400).json({ message: 'Invalid table number' });
+      }
+      
+      const table = await storage.getTableByNumber(tableNumber, restaurantId);
+      
+      if (!table) {
+        return res.status(404).json({ message: 'Table not found' });
+      }
+      
+      res.json(table);
+    } catch (error) {
+      res.status(500).json({ message: 'Failed to fetch table' });
+    }
+  });
+  
+  app.get('/api/tables/:tableNumber/qrcode', async (req, res) => {
+    try {
+      const tableNumber = parseInt(req.params.tableNumber, 10);
+      const restaurantId = req.query.restaurantId ? parseInt(req.query.restaurantId as string, 10) : 1; // Default to restaurant ID 1
+      
+      if (isNaN(tableNumber)) {
+        return res.status(400).json({ message: 'Invalid table number' });
+      }
+      
+      const table = await storage.getTableByNumber(tableNumber, restaurantId);
+      
+      if (!table) {
+        return res.status(404).json({ message: 'Table not found' });
+      }
+      
+      // Generate QR code for table with restaurant ID
+      const qrCodeUrl = await generateQrCodeUrl(tableNumber, restaurantId.toString());
+      
+      res.json({ qrCodeUrl });
+    } catch (error) {
+      res.status(500).json({ message: 'Failed to generate QR code' });
+    }
+  });
+  
+  // Menu endpoints
+  app.get('/api/menu', async (req, res) => {
+    try {
+      const restaurantId = req.query.restaurantId ? parseInt(req.query.restaurantId as string, 10) : undefined;
+      const menuItems = await storage.getMenuItems(restaurantId);
+      res.json(menuItems);
+    } catch (error) {
+      res.status(500).json({ message: 'Failed to fetch menu items' });
+    }
+  });
+  
+  // Add a new menu item
+  app.post('/api/menu', async (req, res) => {
+    try {
+      // Validate the request body against the schema
+      const menuItemData = insertMenuItemSchema.parse(req.body);
+      
+      // Create menu item
+      const menuItem = await storage.createMenuItem(menuItemData);
+      
+      res.status(201).json(menuItem);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: 'Invalid menu item data', errors: error.errors });
+      }
+      res.status(500).json({ message: 'Failed to create menu item' });
+    }
+  });
+  
+  // Update a menu item (e.g., toggle active status)
+  app.put('/api/menu/:id/toggle-active', async (req, res) => {
+    try {
+      const id = parseInt(req.params.id, 10);
+      
+      if (isNaN(id)) {
+        return res.status(400).json({ message: 'Invalid menu item ID' });
+      }
+      
+      // Get the current menu item
+      const menuItem = await storage.getMenuItem(id);
+      
+      if (!menuItem) {
+        return res.status(404).json({ message: 'Menu item not found' });
+      }
+      
+      // Toggle active status
+      const updatedMenuItem = await storage.updateMenuItem(id, { 
+        active: !menuItem.active 
+      });
+      
+      res.json(updatedMenuItem);
+    } catch (error) {
+      res.status(500).json({ message: 'Failed to update menu item' });
+    }
+  });
+  
+  // Update a menu item (all fields)
+  app.put('/api/menu/:id', async (req, res) => {
+    try {
+      const id = parseInt(req.params.id, 10);
+      
+      if (isNaN(id)) {
+        return res.status(400).json({ message: 'Invalid menu item ID' });
+      }
+      
+      // Get the current menu item
+      const menuItem = await storage.getMenuItem(id);
+      
+      if (!menuItem) {
+        return res.status(404).json({ message: 'Menu item not found' });
+      }
+      
+      // Validate the request body against the schema
+      const menuItemData = insertMenuItemSchema.partial().parse(req.body);
+      
+      // Update menu item with provided fields
+      const updatedMenuItem = await storage.updateMenuItem(id, menuItemData);
+      
+      res.json(updatedMenuItem);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: 'Invalid menu item data', errors: error.errors });
+      }
+      res.status(500).json({ message: 'Failed to update menu item' });
+    }
+  });
+  
+  // WhatsApp OTP verification endpoints
+  app.post('/api/verify-phone/send-otp', async (req, res) => {
+    try {
+      const { phoneNumber } = req.body;
+      
+      if (!phoneNumber) {
+        return res.status(400).json({ message: 'Phone number is required' });
+      }
+      
+      // Send OTP via WhatsApp
+      const otpCode = await sendOTPViaWhatsApp(phoneNumber);
+      
+      // In development mode, return the OTP code for testing
+      // In production, this should not be returned for security reasons
+      if (!process.env.WHATSAPP_API_KEY) {
+        return res.status(200).json({ 
+          message: 'OTP sent successfully (development mode)',
+          code: otpCode  // Only returned in development mode
+        });
+      }
+      
+      res.status(200).json({ message: 'OTP sent successfully' });
+    } catch (error) {
+      res.status(500).json({ message: 'Failed to send OTP' });
+    }
+  });
+  
+  app.post('/api/verify-phone/verify-otp', async (req, res) => {
+    try {
+      const { phoneNumber, otpCode } = req.body;
+      
+      if (!phoneNumber || !otpCode) {
+        return res.status(400).json({ message: 'Phone number and OTP code are required' });
+      }
+      
+      // Verify OTP
+      const isValid = verifyOTP(phoneNumber, otpCode);
+      
+      if (!isValid) {
+        return res.status(400).json({ message: 'Invalid OTP code or expired' });
+      }
+      
+      res.status(200).json({ message: 'Phone number verified successfully' });
+    } catch (error) {
+      res.status(500).json({ message: 'Failed to verify OTP' });
+    }
+  });
+  
+  // Restaurant endpoints
+  app.get('/api/restaurants', async (req, res) => {
+    try {
+      const restaurants = await storage.getRestaurants();
+      res.json(restaurants);
+    } catch (error) {
+      res.status(500).json({ message: 'Failed to fetch restaurants' });
+    }
+  });
+  
+  // Get a single restaurant by ID
+  app.get('/api/restaurants/:id', async (req, res) => {
+    try {
+      const id = parseInt(req.params.id, 10);
+      
+      if (isNaN(id)) {
+        return res.status(400).json({ message: 'Invalid restaurant ID' });
+      }
+      
+      const restaurant = await storage.getRestaurant(id);
+      
+      if (!restaurant) {
+        return res.status(404).json({ message: 'Restaurant not found' });
+      }
+      
+      res.json(restaurant);
+    } catch (error) {
+      res.status(500).json({ message: 'Failed to fetch restaurant' });
+    }
+  });
+  
+  // Order endpoints
+  // Get a single order by ID
+  app.get('/api/orders/:id', async (req, res) => {
+    try {
+      const orderId = parseInt(req.params.id, 10);
+      
+      if (isNaN(orderId)) {
+        return res.status(400).json({ message: 'Invalid order ID' });
+      }
+      
+      const order = await storage.getOrder(orderId);
+      
+      if (!order) {
+        return res.status(404).json({ message: 'Order not found' });
+      }
+      
+      // Get table information
+      const table = await storage.getTable(order.tableId);
+      if (!table) {
+        return res.status(404).json({ message: 'Table not found for order' });
+      }
+      
+      // Get order items with menu item details
+      const items = await storage.getOrderItems(order.id);
+      const itemsWithDetails = await Promise.all(items.map(async (item) => {
+        const menuItem = await storage.getMenuItem(item.menuItemId);
+        return {
+          ...item,
+          menuItem
+        };
+      }));
+      
+      // Get restaurant
+      const restaurant = await storage.getRestaurant(table.restaurantId);
+      
+      // Build complete order
+      const completeOrder = {
+        ...order,
+        items: itemsWithDetails,
+        table,
+        restaurant
+      };
+      
+      res.json(completeOrder);
+    } catch (error) {
+      console.error('Error fetching order:', error);
+      res.status(500).json({ message: 'Failed to fetch order' });
+    }
+  });
+
+  app.get('/api/orders', async (req: any, res) => {
+    try {
+      // Check if user is authenticated and is a chef
+      let chefRestaurantId = undefined;
+      if (req.isAuthenticated() && req.user && req.user.role === 'chef' && req.user.restaurantId) {
+        // Chef should only see orders from their restaurant
+        chefRestaurantId = req.user.restaurantId;
+        console.log(`Chef ${req.user.username} (ID: ${req.user.id}) is viewing orders for restaurant ${chefRestaurantId}`);
+      }
+      
+      // Get the restaurantId from the query parameters or use the chef's restaurant ID
+      const requestedRestaurantId = req.query.restaurantId ? parseInt(req.query.restaurantId as string, 10) : undefined;
+      
+      // If chef is logged in, force their restaurant ID, otherwise use the requested one
+      const restaurantId = chefRestaurantId || requestedRestaurantId;
+      
+      // Get the base orders first
+      const orders = await storage.getOrders(restaurantId);
+      
+      // Create a simplified structure to avoid complex Promise.all nesting that might fail
+      const ordersWithItems = [];
+      
+      // Debug: print how many tables we're checking for the restaurant
+      if (restaurantId) {
+        const restaurantTables = await storage.getTables(restaurantId);
+        const tableIds = restaurantTables.map(t => t.id);
+        console.log(`Getting orders for restaurant ${restaurantId}, table IDs: ${tableIds.join(', ')}`);
+      }
+      
+      // Process each order one by one
+      for (const order of orders) {
+        try {
+          // Get table information
+          const table = await storage.getTable(order.tableId);
+          if (!table) {
+            console.error(`Table ${order.tableId} not found for order ${order.id}`);
+            continue; // Skip this order if table is not found
+          }
+          
+          // Extra check: Skip if this order's table doesn't belong to the requested restaurant
+          if (restaurantId && table.restaurantId !== restaurantId) {
+            console.log(`Filtering out order ${order.id} from table ${order.tableId} because it belongs to restaurant ${table.restaurantId}, not ${restaurantId}`);
+            continue;
+          }
+          
+          // Get order items
+          const items = await storage.getOrderItems(order.id);
+          const itemsWithDetails = [];
+          
+          // Process each item
+          for (const item of items) {
+            const menuItem = await storage.getMenuItem(item.menuItemId);
+            if (menuItem) {
+              // Skip if menuItem is from a different restaurant
+              if (menuItem.restaurantId !== table.restaurantId) {
+                console.log(`Skipping menu item ${menuItem.id} because it belongs to restaurant ${menuItem.restaurantId}, not ${table.restaurantId}`);
+                continue;
+              }
+              
+              itemsWithDetails.push({
+                ...item,
+                menuItem
+              });
+            }
+          }
+          
+          // Get restaurant details
+          const restaurant = table.restaurantId ? await storage.getRestaurant(table.restaurantId) : undefined;
+          
+          // Add this order to the result
+          ordersWithItems.push({
+            ...order,
+            items: itemsWithDetails,
+            table,
+            restaurant
+          });
+        } catch (itemError) {
+          console.error(`Error processing order ${order.id}:`, itemError);
+          // Continue with next order instead of failing completely
+        }
+      }
+      
+      res.json(ordersWithItems);
+    } catch (error) {
+      console.error("Error fetching orders:", error);
+      res.status(500).json({ message: 'Failed to fetch orders' });
+    }
+  });
+  
+  app.post('/api/orders', async (req: any, res) => {
+    try {
+      // Validate the request body against the schema
+      const orderData = insertOrderSchema.parse(req.body);
+      
+      // If user is authenticated, add userId to order
+      if (req.isAuthenticated() && req.user && req.user.id) {
+        console.log(`User is authenticated, setting userId to ${req.user.id}`);
+        orderData.userId = req.user.id;
+      } else if (orderData.userId) {
+        // If user is not authenticated but userId is provided, verify it exists
+        const userExists = await storage.getUser(orderData.userId);
+        if (!userExists) {
+          orderData.userId = null;
+        }
+      }
+      
+      // Create order
+      const order = await storage.createOrder(orderData);
+      
+      // Create order items
+      const items = req.body.items || [];
+      for (const item of items) {
+        const orderItem = {
+          orderId: order.id,
+          menuItemId: item.menuItemId,
+          quantity: item.quantity,
+          price: item.price
+        };
+        await storage.createOrderItem(orderItem);
+      }
+      
+      // Fetch complete order with items
+      const orderItems = await storage.getOrderItems(order.id);
+      const table = await storage.getTable(order.tableId);
+      
+      const itemsWithDetails = await Promise.all(orderItems.map(async (item) => {
+        const menuItem = await storage.getMenuItem(item.menuItemId);
+        return {
+          ...item,
+          menuItem: menuItem
+        };
+      }));
+      
+      // Get restaurant info for the order
+      let restaurant = null;
+      if (table) {
+        restaurant = await storage.getRestaurant(table.restaurantId);
+      }
+      
+      const completeOrder = {
+        ...order,
+        items: itemsWithDetails,
+        table: table,
+        restaurant: restaurant
+      };
+      
+      // Broadcast order to relevant clients
+      broadcastMessage(table?.tableNumber.toString() || "", {
+        type: 'ORDER_CREATED',
+        order: completeOrder
+      });
+      
+      // Also broadcast to chef for immediate visibility
+      broadcastMessage("chef", {
+        type: 'ORDER_CREATED',
+        order: completeOrder
+      });
+      
+      // Send WhatsApp message to customer if phone number is provided
+      if (order.customerPhone) {
+        try {
+          const orderNumber = order.restaurantOrderNumber || order.id;
+          await sendWhatsAppMessage(order.customerPhone, 
+            `Thank you for your order! Your order #${orderNumber} has been received and will be ready in about 5 minutes.`
+          );
+        } catch (whatsappErr) {
+          console.error("Failed to send WhatsApp message:", whatsappErr);
+          // Continue with order processing even if WhatsApp fails
+        }
+      }
+      
+      // Return the complete order with all details
+      res.status(201).json(completeOrder);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: 'Invalid order data', errors: error.errors });
+      }
+      res.status(500).json({ message: 'Failed to create order' });
+    }
+  });
+  
+  app.put('/api/orders/:id/status', async (req, res) => {
+    try {
+      const id = parseInt(req.params.id, 10);
+      const { status } = req.body;
+      
+      if (isNaN(id)) {
+        return res.status(400).json({ message: 'Invalid order ID' });
+      }
+      
+      if (!status || !['pending', 'preparing', 'ready'].includes(status)) {
+        return res.status(400).json({ message: 'Invalid status' });
+      }
+      
+      const order = await storage.getOrder(id);
+      
+      if (!order) {
+        return res.status(404).json({ message: 'Order not found' });
+      }
+      
+      // Update order status
+      const updatedOrder = await storage.updateOrderStatus(id, status);
+      
+      if (!updatedOrder) {
+        return res.status(500).json({ message: 'Failed to update order status' });
+      }
+      
+      // Fetch table
+      const table = await storage.getTable(updatedOrder.tableId);
+      
+      // Fetch items
+      const items = await storage.getOrderItems(updatedOrder.id);
+      const itemsWithDetails = await Promise.all(items.map(async (item) => {
+        const menuItem = await storage.getMenuItem(item.menuItemId);
+        return {
+          ...item,
+          menuItem: menuItem
+        };
+      }));
+      
+      // Get restaurant info for the order
+      let restaurant = null;
+      if (table) {
+        restaurant = await storage.getRestaurant(table.restaurantId);
+      }
+      
+      const completeOrder = {
+        ...updatedOrder,
+        items: itemsWithDetails,
+        table: table,
+        restaurant: restaurant
+      };
+      
+      // Broadcast update to relevant clients
+      broadcastMessage(table?.tableNumber.toString() || "", {
+        type: 'ORDER_UPDATED',
+        order: completeOrder
+      });
+      
+      // Also broadcast to chef dashboard for immediate visibility
+      broadcastMessage("chef", {
+        type: 'ORDER_UPDATED',
+        order: completeOrder
+      });
+      
+      // Send WhatsApp message to customer
+      let message = '';
+      const orderNumber = updatedOrder.restaurantOrderNumber || updatedOrder.id;
+      
+      if (status === 'preparing') {
+        message = `Your order #${orderNumber} is now being prepared by our chef!`;
+      } else if (status === 'ready') {
+        message = `Hi ${updatedOrder.customerName},\n\nYour order is ready, please collect your order.`;
+        
+        // Generate a direct WhatsApp link for the customer
+        const whatsappLink = `https://wa.me/${updatedOrder.customerPhone.replace(/\D/g, '')}?text=${encodeURIComponent(message)}`;
+        console.log(`WhatsApp direct link for order #${orderNumber}: ${whatsappLink}`);
+      }
+      
+      if (message && updatedOrder.customerPhone) {
+        try {
+          await sendWhatsAppMessage(updatedOrder.customerPhone, message);
+          console.log(`WhatsApp notification sent for Order #${updatedOrder.id} (${status})`);
+        } catch (whatsappErr) {
+          console.error(`Failed to send WhatsApp message for Order #${updatedOrder.id}:`, whatsappErr);
+          // Continue with order processing even if WhatsApp fails
+        }
+      }
+      
+      res.json(completeOrder);
+    } catch (error) {
+      res.status(500).json({ message: 'Failed to update order status' });
+    }
+  });
+  
+  // Get orders for the current authenticated customer
+  app.get('/api/customer/orders', async (req: any, res) => {
+    try {
+      // Check if user is authenticated
+      if (!req.isAuthenticated()) {
+        return res.status(401).json({ message: 'Not authenticated' });
+      }
+      
+      // Get all orders from this user
+      const allOrders = await storage.getOrders();
+      console.log("Found orders:", allOrders.length, "User ID:", req.user.id, "User:", req.user);
+      
+      // Debug: print all orders and their userIds
+      allOrders.forEach(order => {
+        console.log(`Order ID: ${order.id}, User ID: ${order.userId}, Order status: ${order.status}`);
+      });
+      
+      // Try to match by string comparison as well
+      const userOrders = allOrders.filter(order => {
+        const orderUserId = order.userId;
+        const userIdMatch = orderUserId === req.user.id;
+        const stringMatch = String(orderUserId) === String(req.user.id);
+        
+        if (stringMatch && !userIdMatch) {
+          console.log(`String match but not direct match for order ${order.id}: ${typeof orderUserId} (${orderUserId}) vs ${typeof req.user.id} (${req.user.id})`);
+        }
+        
+        return userIdMatch || stringMatch;
+      });
+      
+      console.log("Filtered user orders:", userOrders.length);
+      
+      // Return a simplified version without all the extended details to avoid potential errors
+      const simplifiedOrders = await Promise.all(userOrders.map(async (order) => {
+        try {
+          const table = await storage.getTable(order.tableId);
+          
+          // Get basic restaurant info if table exists
+          let restaurant = null;
+          if (table && table.restaurantId) {
+            const restaurantData = await storage.getRestaurant(table.restaurantId);
+            if (restaurantData) {
+              restaurant = restaurantData;
+            }
+          }
+          
+          // Get order items
+          const items = await storage.getOrderItems(order.id);
+          const itemsWithDetails = await Promise.all(items.map(async (item) => {
+            let menuItem = null;
+            try {
+              menuItem = await storage.getMenuItem(item.menuItemId);
+            } catch (err) {
+              console.error(`Failed to get menu item ${item.menuItemId}:`, err);
+            }
+            
+            return {
+              ...item,
+              menuItem: menuItem || { 
+                id: item.menuItemId,
+                name: "Unknown Item", 
+                price: item.price 
+              }
+            };
+          }));
+          
+          return {
+            ...order,
+            items: itemsWithDetails,
+            table: table || { id: order.tableId, tableNumber: 0 },
+            restaurant
+          };
+        } catch (err) {
+          console.error(`Error processing order ${order.id}:`, err);
+          // Return a basic version of the order if there was an error
+          return {
+            ...order,
+            items: [],
+            table: { id: order.tableId, tableNumber: 0 }
+          };
+        }
+      }));
+      
+      // Sort by timestamp descending (newest first)
+      simplifiedOrders.sort((a, b) => 
+        new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+      );
+      
+      res.json(simplifiedOrders);
+    } catch (error) {
+      console.error('Error fetching customer orders:', error);
+      res.status(500).json({ message: 'Failed to fetch orders' });
+    }
+  });
+  
+  // Get orders by phone number
+  app.get('/api/customer/orders/phone/:phoneNumber', async (req, res) => {
+    try {
+      const phoneNumber = req.params.phoneNumber;
+      
+      if (!phoneNumber) {
+        return res.status(400).json({ message: 'Phone number is required' });
+      }
+      
+      // Get all orders 
+      const allOrders = await storage.getOrders();
+      
+      // Filter by phone number
+      const formattedRequestPhone = phoneNumber.replace(/\D/g, '');
+      const phoneOrders = allOrders.filter(order => {
+        if (!order.customerPhone) return false;
+        
+        const formattedOrderPhone = order.customerPhone.replace(/\D/g, '');
+        return formattedOrderPhone.includes(formattedRequestPhone) || 
+               formattedRequestPhone.includes(formattedOrderPhone);
+      });
+      
+      console.log(`Found ${phoneOrders.length} orders for phone ${phoneNumber}`);
+      
+      // Return orders with details just like the user orders endpoint
+      const simplifiedOrders = await Promise.all(phoneOrders.map(async (order) => {
+        try {
+          const table = await storage.getTable(order.tableId);
+          
+          // Get basic restaurant info if table exists
+          let restaurant = null;
+          if (table && table.restaurantId) {
+            const restaurantData = await storage.getRestaurant(table.restaurantId);
+            if (restaurantData) {
+              restaurant = restaurantData;
+            }
+          }
+          
+          // Get order items
+          const items = await storage.getOrderItems(order.id);
+          const itemsWithDetails = await Promise.all(items.map(async (item) => {
+            let menuItem = null;
+            try {
+              menuItem = await storage.getMenuItem(item.menuItemId);
+            } catch (err) {
+              console.error(`Failed to get menu item ${item.menuItemId}:`, err);
+            }
+            
+            return {
+              ...item,
+              menuItem: menuItem || { 
+                id: item.menuItemId,
+                name: "Unknown Item", 
+                price: item.price 
+              }
+            };
+          }));
+          
+          return {
+            ...order,
+            items: itemsWithDetails,
+            table: table || { id: order.tableId, tableNumber: 0 },
+            restaurant
+          };
+        } catch (err) {
+          console.error(`Error processing order ${order.id}:`, err);
+          // Return a basic version of the order if there was an error
+          return {
+            ...order,
+            items: [],
+            table: { id: order.tableId, tableNumber: 0 }
+          };
+        }
+      }));
+      
+      // Sort by timestamp descending (newest first)
+      simplifiedOrders.sort((a, b) => 
+        new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+      );
+      
+      res.json(simplifiedOrders);
+    } catch (error) {
+      console.error("Error fetching orders by phone number:", error);
+      res.status(500).json({ message: 'Failed to fetch orders' });
+    }
+  });
+
+  // Admin routes for data management
+  app.post('/api/admin/reset-orders', async (req: any, res) => {
+    try {
+      // For demo purposes, allowing reset without authentication
+      // In production, we would add authentication checks here
+      await storage.resetOrders();
+      res.status(200).json({ message: 'All orders have been reset successfully' });
+    } catch (error) {
+      console.error("Error resetting orders:", error);
+      res.status(500).json({ message: 'Failed to reset orders' });
+    }
+  });
+  
+  return httpServer;
+}

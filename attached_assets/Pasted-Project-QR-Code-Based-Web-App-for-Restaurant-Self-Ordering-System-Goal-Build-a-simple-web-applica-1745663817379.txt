@@ -1,0 +1,87 @@
+Project: QR Code Based Web App for Restaurant Self-Ordering System
+
+Goal:
+Build a simple web application where customers can place orders by scanning a QR code at their table, and chefs can manage orders through their own dashboard — without needing waiters or attendants.
+
+Customer Flow:
+
+Scan QR Code:
+
+Customer sits at a table (example: Table 11).
+
+Scans a QR code placed on the table.
+
+The QR code already contains or passes the table number.
+
+Landing Page After Scanning:
+
+Displays restaurant logo, name, and basic details.
+
+Lists the available food items (menu).
+
+Customer can browse and add items to cart.
+
+Place Order:
+
+Customer provides basic details (like WhatsApp number, pre-filled table number from QR).
+
+No online payment integration for now.
+
+Customer places the order through the web app.
+
+Order Confirmation:
+
+Customer sees a message like:
+“Your order has been received and will be ready in 5 minutes!”
+
+Kitchen (Chef) Flow:
+
+Chef Dashboard (Separate Web App View):
+
+Chef logs in and sees new orders coming in real-time.
+
+Each order shows table number, customer details, and ordered items.
+
+Order Processing:
+
+Chef clicks “Accept Order” to start preparing.
+
+Status updates for customer:
+“Your order is being prepared.”
+
+Order Completion:
+
+Once food is ready, the chef clicks “Order Ready”.
+
+Notification:
+
+An automatic WhatsApp message triggers to the customer:
+“Your order is ready! Please collect it at the counter.”
+
+The customer’s web app also shows order status as “Ready”.
+
+Payment Handling:
+
+No payment is done online.
+
+Customer collects food, pays at the counter directly (cash/card/UPI as per restaurant setup).
+
+Benefits:
+
+Reduces the need for waiters/attendants.
+
+Only 1–2 chefs are needed to manage the entire restaurant flow.
+
+Faster, contactless, and efficient service.
+
+Key Features to Develop:
+
+QR code generation with table mapping.
+
+Customer web view for menu, cart, and ordering.
+
+Chef dashboard for managing and updating order statuses.
+
+WhatsApp API integration for customer notifications.
+
+Real-time status updates between customer and kitchen dashboard.
