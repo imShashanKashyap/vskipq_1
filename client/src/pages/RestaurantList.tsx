@@ -140,8 +140,8 @@ export default function RestaurantList() {
                 <Utensils className="w-5 h-5 text-white" />
               </div>
               <div className="ml-2.5">
-                <h1 className="font-semibold text-lg text-gray-800">Scan2Order</h1>
-                <p className="text-[10px] text-gray-500 -mt-1">Dine smart, order easy</p>
+                <h1 className="font-semibold text-lg text-gray-800">VskipQ</h1>
+                <p className="text-[10px] text-gray-500 -mt-1">No Queue, Only You</p>
               </div>
             </div>
             
